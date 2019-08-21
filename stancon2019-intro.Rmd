@@ -242,9 +242,9 @@ prior_preds <- t(replicate(1000, expr = {
   simple_poisson_dpg(
     traps = pest_data$traps,
     alpha_mean = 0,
-    alpha_sd = 10,
+    alpha_sd = 1,
     beta_mean = 0,
-    beta_sd = 10
+    beta_sd = 1
   )
 }))
 
@@ -258,7 +258,7 @@ summary(apply(prior_preds, 1, mean))
 summary(apply(prior_preds, 1, min))
 ```
 ```{r prior-pred-max}
-hist(apply(prior_preds, 1, max))
+summary(apply(prior_preds, 1, max))
 ```
 
 
@@ -277,7 +277,7 @@ simple_poisson_dpg(
 Simulate 1000 times and calculate summary stats:
 
 ```{r prior-pred-better}
-prior_preds <- t(replicate(1000, expr = {
+prior_preds <- t(replicate(10000, expr = {
   simple_poisson_dpg(
     traps = pest_data$traps,
     alpha_mean = log(7),
@@ -290,13 +290,9 @@ prior_preds <- t(replicate(1000, expr = {
 
 ```{r}
 summary(apply(prior_preds, 1, mean))
-```
 
-```{r}
 summary(apply(prior_preds, 1, min))
-```
 
-```{r}
 summary(apply(prior_preds, 1, max))
 ```
 
@@ -320,7 +316,11 @@ list elements must match the names used in the `data` block of the Stan program.
 standata_simple <- list(
   N = nrow(pest_data), 
   complaints = pest_data$complaints,
-  traps = pest_data$traps
+  traps = pest_data$traps,
+  alpha_mean = log(7),
+  alpha_sd = log(2),
+  beta_mean = log(2),
+  beta_sd = log(2)
 )
 str(standata_simple)
 ```
@@ -332,7 +332,7 @@ fit_simple <- sampling(comp_simple, data = standata_simple,
                        # these are the defaults but specifying them anyway
                        # so you can see how to use them: 
                        # posterior sample size = chains * (iter-warmup)
-                       chains = 4, iter = 2000, warmup = 1000)
+                       chains = 4, iter = 2000, warmup = 1000, cores=4)
 ```
 
 Print the summary of the intercept and slope parameters: 
@@ -346,7 +346,6 @@ We can also plot the posterior distributions:
 ```{r mcmc_hist}
 # https://mc-stan.org/bayesplot/reference/MCMC-distributions
 draws <- as.matrix(fit_simple, pars = c('alpha','beta'))
-head(draws)
 mcmc_hist(draws) # marginal posteriors of alpha and beta
 mcmc_scatter(draws, alpha = 0.2, size = 1) # posterior of (alpha,beta)
 ```
@@ -379,7 +378,7 @@ model fits.
 ```{r y_rep_simple}
 # see http://mc-stan.org/rstan/articles/stanfit_objects.html for various ways
 # of extracting contents from stanfit objects
-y_rep <- as.matrix(fit_simple, pars = "y_rep")
+y_rep <- as.matrix(fit_simple, pars = "pred_complaints_rep")
 ```
 
 ```{r marginal_PPC}
@@ -490,6 +489,8 @@ Add these new variables to the data list for Stan.
 ```{r add-predictors-to-standata}
 standata_simple$log_sq_foot <- pest_data$log_sq_foot_1e4 # log(total_sq_foot/1e4)
 standata_simple$live_in_super <- pest_data$live_in_super
+standata_simple$beta_super_mean <- log(1)
+standata_simple$beta_super_sd <- log(2)
 ```
 
 
@@ -507,13 +508,13 @@ comp_multi <- stan_model('stan_programs/multiple_poisson_regression.stan')
 
 ```{r fit_multi}
 fit_multi <- sampling(comp_multi, data = standata_simple, 
-                      refresh = 100) # turn off printed progress updates
+                      refresh = 500) # turn off printed progress updates
 print(fit_multi, pars = c("alpha", "beta", "beta_super"))
 ```
 
 
 ```{r ppc_dens_overlay-random-subset}
-y_rep <- as.matrix(fit_multi, pars = "y_rep")
+y_rep <- as.matrix(fit_multi, pars = "pred_complaints_rep")
 ppc_dens_overlay(standata_simple$complaints, y_rep[1:200,])
 
 # in this case we have very high effective sample sizes, but if there is
@@ -592,6 +593,11 @@ negative-binomial gets closer and closer to the Poisson.
 
 ### Stan program for negative-binomial regression
 
+```{r add-phi-predictors-to-standata}
+standata_simple$phi_mean <- 0.5
+standata_simple$phi_sd <- 0.5
+```
+
 * Write `multiple_NB_regression.stan` together
 
 ```{r compile-multi-NB, cache=TRUE, results="hide", message=FALSE}
@@ -608,10 +614,14 @@ fit_multi_NB <- sampling(comp_multi_NB, data = standata_simple, refresh = 250)
 samps_NB <- rstan::extract(fit_multi_NB) 
 ```
 
+```{r fit_hier_NB-low-ESS}
+print(fit_multi_NB, pars = c('alpha', 'beta', 'beta_super','phi'), probs=c(0.05,0.95))
+```
+
 Let's look at our predictions vs. the data.
 
 ```{r ppc_dens_overlay_NB}
-ppc_dens_overlay(y = standata_simple$complaints, yrep = samps_NB$y_rep[1:200, ])
+ppc_dens_overlay(y = standata_simple$complaints, yrep = samps_NB$pred_complaints_rep[1:200,])
 ```
 
 It appears that our model now captures both the number of small counts better
@@ -620,7 +630,7 @@ as well as the tails.
 Let's check the proportion of zeros:
 
 ```{r prop_zero_NB}
-ppc_stat(y = standata_simple$complaints, yrep = samps_NB$y_rep, 
+ppc_stat(y = standata_simple$complaints, yrep = samps_NB$pred_complaints_rep, 
          stat = "prop_zero", binwidth = 0.01)
 ```
 
@@ -630,7 +640,7 @@ Check predictions by number of traps:
 ```{r}
 ppc_intervals(
   y = standata_simple$complaints, 
-  yrep = samps_NB$y_rep,
+  yrep = samps_NB$pred_complaints_rep,
   x = standata_simple$traps + rnorm(standata_simple$N, 0, 0.2)
 ) + 
   labs(x = "Number of traps (jittered)", y = "Number of complaints")
@@ -643,18 +653,12 @@ information into the model.
 ```{r ppc-group-means, fig.width=7, fig.height=6}
 ppc_stat_grouped(
   y = standata_simple$complaints, 
-  yrep = samps_NB$y_rep, 
+  yrep = samps_NB$pred_complaints_rep, 
   group = pest_data$building_id, 
   stat = 'mean',
   binwidth = 0.2
 )
 ```
-
-We're getting plausible predictions for most building means but some are
-estimated better than others and some have larger uncertainties than we might
-expect. If we explicitly model the variation across buildings we may be able to
-get much better estimates.
-
 ## Hierarchical modeling
 
 ### Modeling varying intercepts for each building
@@ -738,7 +742,7 @@ building_data <- pest_data %>%
     as.matrix()
 
 # Make data list for Stan
-standata_hier <-
+standata_hier_orig <-
   with(pest_data,
         list(complaints = complaints,
              N = length(complaints),
@@ -752,6 +756,18 @@ standata_hier <-
              building_data = building_data
              )
         )
+
+standata_hier <- standata_simple
+standata_hier$M <- standata_hier_orig$M
+standata_hier$mo_idx <- standata_hier_orig$mo_idx
+standata_hier$J <- standata_hier_orig$J
+standata_hier$K <- standata_hier_orig$K
+standata_hier$building_idx <- standata_hier_orig$building_idx
+standata_hier$building_data <- standata_hier_orig$building_data
+standata_hier$mub_sigma_mean <- 0
+standata_hier$mub_sigma_sd <- 1
+standata_hier$zeta_mean <- 0
+standata_hier$zeta_sd <- 1
 ```
 
 ### Compile and fit the hierarchical model
@@ -799,7 +815,7 @@ something that reparameterization will resolve. We will go through:
 Then we print the fits for the parameters that are of most interest.
 
 ```{r fit_hier_NB-low-ESS}
-print(fit_hier_NB, pars = c('sigma_mu','beta','alpha','phi','mu'))
+print(fit_hier_NB, pars = c('alpha', 'beta', 'mub','mub_sigma','zeta','phi'), probs=c(0.05,0.95))
 ```
 You can see that the effective sample sizes are quite low for many of the parameters
 relative to the total number of samples. This alone isn't indicative of the need
@@ -812,7 +828,7 @@ transitions form a pattern.
 color_scheme_set("brewer-Spectral") 
 mcmc_trace(
   # use as.array to keep the markov chains separate for trace plots
-  as.array(fit_hier_NB,pars = 'sigma_mu'),
+  as.array(fit_hier_NB,pars = 'mub_sigma'),
   np = nuts_params(fit_hier_NB),
   window = c(500,1000) # zoom into a window to see more clearly
 )
@@ -826,9 +842,9 @@ correspond to spots where sampler gets stuck.
 # assign to object so we can compare to another plot later
 scatter_with_divs <- mcmc_scatter(
   as.array(fit_hier_NB),
-  pars = c("mu[3]", "sigma_mu"),
+  pars = c("mub[4]", "mub_sigma"),
   # look at sigma on log-scale (what Stan uses under the hood for positive parameters)
-  transform = list("sigma_mu" = "log"), 
+  transform = list("mub_sigma" = "log"), 
   size = 1,
   alpha = 0.3,
   np = nuts_params(fit_hier_NB),
@@ -854,7 +870,7 @@ for (j in 1:N_sims) {
   sigma_mu_prior[j] <- abs(rnorm(1, mean = 0, sd = 1))
   mu_prior[j] <- rnorm(1, mean = 0, sd = sigma_mu_prior[j])
 }
-prior_draws <- cbind("mu" = mu_prior, "log(sigma_mu)" = log(sigma_mu_prior))
+prior_draws <- cbind("mu" = mu_prior, "log(mub_sigma)" = log(sigma_mu_prior))
 
 mcmc_scatter(prior_draws)
 ```
@@ -873,7 +889,7 @@ Another way to look at the divergences is via a parallel coordinates plot.
 # https://mc-stan.org/bayesplot/reference/MCMC-parcoord.html#plot-descriptions
 # this plot is a bit computationally intensive
 parcoord_with_divs <- mcmc_parcoord(
-  as.array(fit_hier_NB, pars = c("sigma_mu", "mu")),
+  as.array(fit_hier_NB, pars = c("mub_sigma", "mu")),
   np = nuts_params(fit_hier_NB)
 )
 parcoord_with_divs
@@ -923,7 +939,8 @@ You should have no divergences (or only a few) this time and much improved
 effective sample sizes:
 
 ```{r fit_hier_NB_ncp-ESS}
-print(fit_hier_NB_ncp, pars = c('sigma_mu','beta','alpha','phi','mu')) # optional 'probs' argument
+# use the optional probs argument to set the credible interval you want
+print(fit_hier_NB, pars = c('alpha', 'beta', 'mub','mub_sigma','zeta','phi'), probs=c(0.05,0.95))
 ```
 
 
@@ -933,8 +950,8 @@ compare:
 ```{r compare-scatterplots}
 scatter_no_divs <- mcmc_scatter(
   as.array(fit_hier_NB_ncp),
-  pars = c("mu[3]", 'sigma_mu'),
-  transform = list('sigma_mu' = "log"),
+  pars = c("mu[4]", 'mub_sigma'),
+  transform = list('mub_sigma' = "log"),
   size = 1,
   alpha = 0.3,
   np = nuts_params(fit_hier_NB_ncp)
@@ -955,7 +972,7 @@ of the posterior that the chains were not exploring.
 The marginal PPC plot, again.
 
 ```{r ppc-full-hier}
-y_rep <- as.matrix(fit_hier_NB_ncp, pars = "y_rep")
+y_rep <- as.matrix(fit_hier_NB_ncp, pars = "pred_complaints_rep")
 ppc_dens_overlay(standata_hier$complaints, y_rep[1:200,])
 ```
 
@@ -1040,3 +1057,8 @@ ppc_intervals_grouped(
     title = "Traps vs predicted complaints by building"
   )
 ```
+
+We're getting plausible predictions for most building means but some are
+estimated better than others and some have larger uncertainties than we might
+expect. If we explicitly model the variation across buildings we may be able to
+get much better estimates.
