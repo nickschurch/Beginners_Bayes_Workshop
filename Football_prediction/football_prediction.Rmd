@@ -1,0 +1,284 @@
+---
+title: "football_prediction"
+author: "Nick Schurch"
+date: "August 21, 2019"
+output: html_document
+---
+## Setup
+
+```{r setup, results="hide", message=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  dev = "png",
+  dpi = 150,
+  fig.align = "center",
+  comment = NA
+)
+library(rstan)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(bayesplot)
+library(tidyverse)
+
+theme_set(bayesplot::theme_default())
+
+# seed for R's pseudo-RNGs, not Stan's
+set.seed(2896) 
+
+# load data and munge it about a bit...
+data <- as.tibble(read.csv2("training.csv", sep=",", stringsAsFactors = FALSE)) %>%
+  separate("date", c("Year", "Month", "Day"), sep = "-") %>%
+  unite("match", c("home_team", "away_team"), sep=" vs ") %>%
+  mutate(home_win = ifelse(full_time_home_goals>full_time_away_goals, 1, 0)) %>%
+  mutate(away_win = ifelse(full_time_home_goals<full_time_away_goals, 1, 0)) %>%
+  mutate(draw = ifelse(full_time_home_goals==full_time_away_goals, 1, 0)) %>%
+  arrange(match)
+
+# load the test data and munge it a bit...
+test_data <- as.tibble(read.csv2("test.csv", sep=",", stringsAsFactors = FALSE))%>%
+  unite("match", c("home_team", "away_team"), sep=" vs ") %>%
+  separate("date", c("Year", "Month", "Day"), sep = "-") %>%
+  rowid_to_column("ID") %>%
+  mutate(home_win = 0) %>%
+  mutate(draw = 0) %>%
+  mutate(away_win = 0) %>%
+  arrange(match)
+```
+
+## Predict the result sof the test_data matches from the data
+
+The best simple predictor of the results in test_data is simple to take the resutls of the same match from the previous year. This is where we'll start.
+
+```{r pred1}
+# replace nan fields with global fractional chances
+gdata <- data %>% select(c("home_win", "draw", "away_win")) %>%
+    summarize_all(mean)
+
+# loop over matches getting the historical average for each game, and use that as a prediction
+for (i in seq(1:length(test_data$match))){
+  thismatch = test_data$match[i]
+  ssdata <- data %>% filter(match==thismatch) %>%
+    select(c("home_win", "draw", "away_win")) %>%
+    summarize_all(mean)
+  
+  if (!is.na(ssdata$home_win)){
+    test_data[i,]$home_win = ssdata$home_win
+    test_data[i,]$draw = ssdata$draw
+    test_data[i,]$away_win = ssdata$away_win
+  } else {
+    test_data[i,]$home_win = gdata$home_win
+    test_data[i,]$draw = gdata$draw
+    test_data[i,]$away_win = gdata$away_win
+  }
+}
+
+outdata <- test_data %>% arrange(ID) %>%
+  select(c("home_win", "draw", "away_win"))
+
+write_csv(outdata, "basic_pred.csv", col_names=TRUE)
+```
+
+## actual modelling
+
+OK, lets try some actual modelling and see how it looks. We'll start with the hypothesis that the team is important and so is who is home and who is away and we're going to try to model the number of goals a team scores per game. OK, lets load the data again keeping teams seperate.
+
+```{r data_reload}
+# load data and munge it about a bit...
+data <- as.tibble(read.csv2("training.csv", sep=",", stringsAsFactors = FALSE)) %>%
+  separate("date", c("Year", "Month", "Day"), sep = "-") %>%
+  mutate(home_team_ind = as.numeric(as.factor(home_team))) %>%
+  mutate(away_team_ind = as.numeric(as.factor(away_team))) %>%
+  mutate(home_win = ifelse(full_time_home_goals>full_time_away_goals, 1, 0)) %>%
+  mutate(away_win = ifelse(full_time_home_goals<full_time_away_goals, 1, 0)) %>%
+  mutate(draw = ifelse(full_time_home_goals==full_time_away_goals, 1, 0))
+```
+
+OK, so for our simplest model we're just going to predict the number of goals scored by each team in home games.
+
+```{r stan-data}
+standata_simplest_home <- list(
+  Ng = nrow(data),
+  Nht = max(data$home_team_ind),
+  goals = data$full_time_home_goals,
+  hteam_ind = data$home_team_ind,
+  alpha_mean = log(2),
+  alpha_sd = 1,
+  phi_mean = 1,
+  phi_std = 1,
+  hteam_mean = log(2),
+  hteam_sigma = log(2)
+)
+```
+
+OK, lets compile the model...
+
+```{r compile-simple-poisson}
+comp_simplest <- stan_model('../stan_programs/simplest_football_regression.stan')
+```
+
+Now lets fit the data...
+
+```{r fit_simple, cache=TRUE}
+fit_simple_home <- sampling(comp_simplest, data = standata_simplest_home, chains = 4, iter = 2000, warmup = 1000, cores=4)
+```
+
+OK, so, lets look at the results:
+
+```{r results_simple_P}
+print(fit_simple_home, pars=c("alpha", "phi", "hteam"))
+```
+
+Nice - OK, so I guess we should check that this is working by plotting a bunch of stuff..
+
+First lets look at the marginal priors for some of the teams:
+
+```{r mcmc_hist}
+# https://mc-stan.org/bayesplot/reference/MCMC-distributions
+draws <- as.matrix(fit_simple_home, pars = c('hteam'))
+mcmc_hist(draws[,1:16]) # marginal posteriors of the teams
+```
+
+We can compare this with the input prior for these parameters to show that the model is genuinely learning something useful from the data
+
+```{r compare-prior-posterior}
+hteam_prior_post <- cbind(hteam_prior = rnorm(4000, log(2), log(2)), 
+                          hteam_posterior = draws[,1:15])
+mcmc_hist(hteam_prior_post, facet_args = list(nrow = 4), binwidth = 0.1) + 
+  xlim(range(hteam_prior_post))
+```
+
+### Posterior predictive checking
+
+Lets check that the output of the moedl - the posteriors - are a reasonable representation of the data. First lets look at the distribution of the number of home goals scored in the games, vs the same for a bunch of the model simulations. Note that this is a KDE estimateion method wchich smears out the discrete distributions.
+
+```{r y_rep_simple}
+# see http://mc-stan.org/rstan/articles/stanfit_objects.html for various ways
+# of extracting contents from stanfit objects
+y_rep <- as.matrix(fit_simple_home, pars = "pred_goals_rep")
+```
+
+```{r marginal_PPC}
+# https://mc-stan.org/bayesplot/reference/PPC-distributions#plot-descriptions
+ppc_dens_overlay(y = standata_simplest$goals, yrep = y_rep[1:200,])
+```
+
+Looks like we are under-predicting low-scoring games a bit. Not sure I'm that worried about this at this stage....
+
+```{r ppc_bars}
+# https://mc-stan.org/bayesplot/reference/PPC-discrete#plot-descriptions
+ppc_bars(standata_simplest$goals, yrep = y_rep)
+```
+
+Interesting, it looks like I'm slightly over-predicting the number of no goals, and underpredicting the number of 1 & 2 goal games, but its not a dreadful fit. Lets see what happens when we feed it the away goal details...
+
+```{r stan-data}
+standata_simplest_away <- list(
+  Ng = nrow(data),
+  Nht = max(data$away_team_ind),
+  goals = data$full_time_away_goals,
+  hteam_ind = data$away_team_ind,
+  alpha_mean = log(2),
+  alpha_sd = 1,
+  phi_mean = 1,
+  phi_std = 1,
+  hteam_mean = log(2),
+  hteam_sigma = log(2)
+)
+```
+
+
+```{r fit_simple, cache=TRUE}
+fit_simple_away <- sampling(comp_simplest, data = standata_simplest_away, chains = 4, iter = 2000, warmup = 1000, cores=4)
+```
+
+```{r results_simple_P}
+print(fit_simple_away, pars=c("alpha", "phi", "hteam"))
+```
+
+Nice! There is a clear shift in `alpha` showing that away teams score fewer goals! Lets plot the teap performances against for home games vs away games and see fi they look consistant - i.e. that good teams at home are still good away...
+
+```{r team_performace_plots, fig.width=5, fig.asp=1.0}
+team_performace <- as.data.frame(cbind(summary(fit_simple_home, pars=c("hteam"), probs=c(0.05,0.95))$summary[,c(1,4,5)],summary(fit_simple_away, pars=c("hteam"),probs=c(0.05,0.95))$summary[,c(1,4,5)]))
+away_offset = summary(fit_simple_home, pars=c("alpha"))$summary[,1]-summary(fit_simple_away, pars=c("alpha"))$summary[,1]
+colnames(team_performace) <- c("home_performance", "h_lb", "h_ub", "away_performance", "a_lb", "a_ub")
+lims=c(-0.4,0.8)
+ggplot(team_performace, aes(x=home_performance, away_performance)) +
+  geom_point() +
+  xlim(lims) +
+  ylim(lims) +
+  geom_abline(slope=1, intercept=0) + 
+  geom_abline(slope=1, intercept=-away_offset, color='blue')
+```
+
+Sweet! OK, so now we can update the model to model not the number of goals home and away for each game, but rather model the goal difference for pairs of teams, taking both home and away goal data for the teams...
+
+OK, lets compile the new model, and fit it
+
+```{r stan-data}
+standata_simple <- list(
+  Ng = nrow(data),
+  Nt = max(data$away_team_ind),
+  hgoals = data$full_time_home_goals,
+  agoals = data$full_time_away_goals,
+  goaldiff = data$full_time_home_goals - data$full_time_away_goals,
+  hteam_ind = data$home_team_ind,
+  ateam_ind = data$away_team_ind,
+  a_alpha_mean = log(2),
+  a_alpha_sd = 1,
+  h_alpha_mean = log(2),
+  h_alpha_sd = 1,
+  hteam_mean = log(2),
+  hteam_sigma = log(2),
+  ateam_mean = log(2),
+  ateam_sigma = log(2),
+  beta_sd = 1
+)
+```
+
+```{r fit_simple, cache=TRUE}
+remove(fit_simple)
+comp_simple <- stan_model('../stan_programs/simple_football_regression.stan')
+fit_simple <- sampling(comp_simple, data = standata_simple, chains = 4, iter = 2000, warmup = 1000, cores=4)
+```
+
+```{r results_simple_P}
+options(max.print=1000000)
+print(fit_simple, pars=c("a_alpha", "h_alpha", "a_phi", "h_phi", "hteam", "ateam"), probs=c(0.25,0.975))
+```
+
+
+```{r ppc_bars}
+# https://mc-stan.org/bayesplot/reference/PPC-discrete#plot-descriptions
+preds <- as.data.frame(fit_simple, pars = "pred_goaldiff_rep_2d")
+y_rep <- as.data.frame(preds[[paste0("pred_goaldiff_rep_2d[", data$home_team_ind[1], ",", data$away_team_ind[1], "]")]])
+for (n in seq(2:nrow(data))){
+  y_rep <- cbind(y_rep,preds[[paste0("pred_goaldiff_rep_2d[", data$home_team_ind[n], ",", data$away_team_ind[n], "]")]])
+}
+ppc_bars(standata_simple$goaldiff, yrep = as.matrix(y_rep))
+```
+
+
+Nice. We're overpredicting 1-2 goal home wins slightly, and under-predicting small awa wins a bit, but its not bad! Lets quickly count the number home and away wins and draw in the data, and the same from the distributions to see if we're strongly skewed...
+
+```{r}
+print("In the data:")
+print(paste("  Total home wins:", sum(data$home_win), signif(sum(data$home_win)/nrow(data), digits=2)))
+print(paste("  Total away wins:", sum(data$away_win), signif(sum(data$away_win)/nrow(data), digits=2)))
+print(paste("  Total draws:", sum(data$draw), signif(sum(data$draw)/nrow(data), digits=2)))
+
+print("In the simulations:")
+colnames(y_rep) <- seq(1:ncol(y_rep))
+y_rep <- as.data.frame(y_rep)
+nelem <- nrow(y_rep)*ncol(y_rep)
+nhwins <- length(y_rep[y_rep>0])
+ndraw <- length(y_rep[y_rep==0])
+nawins <- length(y_rep[y_rep<0])
+print(paste("  Total home wins:", nhwins, signif(nhwins/nelem, digits=2)))
+print(paste("  Total away wins:", nawins, signif(nawins/nelem, digits=2)))
+print(paste("  Total draws:", ndraw, signif(ndraw/nelem, digits=2)))
+```
+
+OK, so this looks like we really are over-predicting home wins. This is an interesting challenge. I wonder how we could improve the model here. I can imagine quite a lot of extensions to this - what about form, for example. Are teams that won their previous game, more likely to win thei next game? Does leading at half time change whether you are likely to win the game?
+
+Things for another day.
